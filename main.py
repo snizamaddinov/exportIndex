@@ -2,6 +2,7 @@ from opensearchpy import connections, helpers, RequestsHttpConnection, AWSV4Sign
 from opensearchpy import exceptions
 from decouple import config
 from boto3.session import Session
+import sys
 
 SRC_INDEX_NAME = config("SRC_INDEX_NAME")
 DEST_INDEX_NAME = config("DEST_INDEX_NAME")
@@ -28,7 +29,7 @@ def create_connections():
 
     connections.create_connection(
         alias="local",
-        hosts=[{"host": config('LOCAL_OPENSEARCH_HOST'), "port": config('LOCAL_OPENSEARCH_PORT')}],
+        hosts=[{"host": config('DEST_OPENSEARCH_HOST'), "port": config('DEST_OPENSEARCH_PORT')}],
         use_ssl=False,
         verify_certs=False,
     )
@@ -124,6 +125,8 @@ def transfer(batch_size=READ_BATCH_SIZE, dry_run=False):
     src, dst = get_clients()
     ensure_destination_index(dst, src)
 
+    if dry_run:
+        print('\n\nRunning without insert\n\n')
     buffer = []
     total_sent = 0
     for hit in iter_source_hits(src, batch_size):
@@ -144,5 +147,6 @@ def transfer(batch_size=READ_BATCH_SIZE, dry_run=False):
     print(f"transfer finished total_sent={total_sent}")
 
 if __name__ == "__main__":
+    dry_run = "--dry-run" in sys.argv
     create_connections()
-    transfer()
+    transfer(dry_run=dry_run)
