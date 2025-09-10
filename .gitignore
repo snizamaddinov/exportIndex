@@ -1,0 +1,5 @@
+.env
+opensearch_venv
+.venv 
+venv
+*.pyc
