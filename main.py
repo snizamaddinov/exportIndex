@@ -3,9 +3,9 @@ from opensearchpy import exceptions
 from decouple import config
 from boto3.session import Session
 
-INDEX_NAME = "bedrock-knowledge-base-default-index"
-MAX_DOC = 100
-READ_BATCH_SIZE = 200
+SRC_INDEX_NAME = config("SRC_INDEX_NAME")
+DEST_INDEX_NAME = config("DEST_INDEX_NAME")
+READ_BATCH_SIZE = 500
 
 def create_connections():
     session = Session(aws_access_key_id=config('AWS_ACCESS_KEY_ID'),
@@ -28,7 +28,7 @@ def create_connections():
 
     connections.create_connection(
         alias="local",
-        hosts=[{"host": "localhost", "port": 9200}],
+        hosts=[{"host": config('LOCAL_OPENSEARCH_HOST'), "port": config('LOCAL_OPENSEARCH_PORT')}],
         use_ssl=False,
         verify_certs=False,
     )
@@ -38,19 +38,19 @@ def get_clients():
     dst = connections.get_connection(alias="local")
     return src, dst
 
-def _unwrap_typeless_mappings(mappings):
-    if "mappings" in mappings:
-        mappings = mappings["mappings"]
-    # unwrap old-typed mappings like {"_doc": {...}}
-    if isinstance(mappings, dict) and len(mappings) == 1 and list(mappings.keys())[0].startswith("_"):
-        mappings = list(mappings.values())[0]
-    return mappings
+def _unwrap_typeless_mappings(m):
+    if "mappings" in m:
+        m = m["mappings"]
 
-def _clean_knn_params(mappings):
-    # ensure we don't carry serverless-only knobs that could fail even with index.knn=true
-    props = mappings.get("properties", {})
+    # unwrap old-typed mappings like {"_doc": {...}}
+    if isinstance(m, dict) and len(m) == 1 and list(m.keys())[0].startswith("_"):
+        m = list(m.values())[0]
+    return m
+
+def _clean_knn_params(m):
+    props = m.get("properties", {})
     def cleanse(pdict):
-        for k, v in pdict.items():
+        for k, v in list(pdict.items()):
             if isinstance(v, dict):
                 t = v.get("type")
                 if t in ("knn_vector", "vector", "text_embedding"):
@@ -60,29 +60,17 @@ def _clean_knn_params(mappings):
                 if "properties" in v:
                     cleanse(v["properties"])
         return pdict
-    mappings["properties"] = cleanse(props)
-    return mappings
+    m["properties"] = cleanse(props)
+    return m
 
-def ensure_destination_index_v2(dst_client, src_client, index_name):
-    index_name_local = f'{index_name}_local'
-    exists = dst_client.indices.exists(index=index_name_local)
+def ensure_destination_index(dst_client, src_client):
+    exists = dst_client.indices.exists(index=DEST_INDEX_NAME)
     print(f"destination index exists={exists}")
     if exists:
         return
-    src_mapping = src_client.indices.get_mapping(index=index_name)
-    mappings = src_mapping[index_name]["mappings"] if index_name in src_mapping else {}
-    print("has mapping: ",  mappings is not None)
-    # dst_client.indices.create(index=index_name_local, body={"mappings": mappings})
-    print("destination index created")
+    src_mapping_all = src_client.indices.get_mapping(index=SRC_INDEX_NAME)
+    src_mapping = src_mapping_all.get(SRC_INDEX_NAME, {})
 
-def ensure_destination_index(dst_client, src_client, index_name):
-    index_name_local = f'{index_name}_local'
-    exists = dst_client.indices.exists(index=index_name_local)
-    print(f"destination index exists={exists}")
-    if exists:
-        return
-    src_mapping_all = src_client.indices.get_mapping(index=index_name)
-    src_mapping = src_mapping_all.get(index_name, {})
     mappings = _unwrap_typeless_mappings(src_mapping)
     mappings = _clean_knn_params(mappings if isinstance(mappings, dict) else {})
 
@@ -96,8 +84,7 @@ def ensure_destination_index(dst_client, src_client, index_name):
     }
 
     try:
-        # print(mappings)
-        dst_client.indices.create(index=index_name_local, body=settings)
+        dst_client.indices.create(index=DEST_INDEX_NAME, body=settings)
         print("destination index created with index.knn=true")
     except exceptions.RequestError as e:
         print(f"index create failed: {e}")
@@ -110,9 +97,9 @@ def source_query_body():
         "sort": [{"_id": "asc"}]
     }
 
-def iter_source_hits(src_client, index_name, batch_size):
+def iter_source_hits(src_client, batch_size):
     body = source_query_body()
-    resp = src_client.search(index=index_name, body=body, size=batch_size)
+    resp = src_client.search(index=SRC_INDEX_NAME, body=body, size=batch_size)
     hits = resp.get("hits", {}).get("hits", []) or []
     while hits:
         for h in hits:
@@ -121,50 +108,37 @@ def iter_source_hits(src_client, index_name, batch_size):
         if not last_sort:
             break
         body["search_after"] = last_sort
-        resp = src_client.search(index=index_name, body=body, size=batch_size)
+        resp = src_client.search(index=SRC_INDEX_NAME, body=body, size=batch_size)
         hits = resp.get("hits", {}).get("hits", []) or []
 
-def to_bulk_actions(hits, dest_index):
-    print('desct index: ', dest_index)
+def to_bulk_actions(hits):
     for h in hits:
         yield {
             "_op_type": "index",
-            "_index": dest_index,
+            "_index": DEST_INDEX_NAME,
             "_id": h["_id"],
             "_source": h.get("_source", {})
         }
 
-def transfer(index_name=INDEX_NAME, batch_size=READ_BATCH_SIZE, dry_run=False):
+def transfer(batch_size=READ_BATCH_SIZE, dry_run=False):
     src, dst = get_clients()
-    index_name_local = f"{index_name}_local"
-    ensure_destination_index(dst, src, index_name)
-    # return
+    ensure_destination_index(dst, src)
+
     buffer = []
     total_sent = 0
-    i = 0
-    for hit in iter_source_hits(src, index_name, batch_size):
-        i += 1
+    for hit in iter_source_hits(src, batch_size):
         buffer.append(hit)
-
-        if i >= MAX_DOC:
-            break
-
         if len(buffer) >= batch_size:
             print(f"bulk write start count={len(buffer)} total_sent={total_sent}")
             if not dry_run:
-                helpers.bulk(dst, to_bulk_actions(buffer, index_name_local), request_timeout=120)
+                helpers.bulk(dst, to_bulk_actions(buffer), request_timeout=120)
             total_sent += len(buffer)
             print(f"bulk write done batch_count={len(buffer)} total_sent={total_sent}")
             buffer = []
-        
-
-    print("for finish..")
     if buffer:
-        connections.remove_connection('aws')
-        print(dst.info())
         print(f"bulk write start count={len(buffer)} total_sent={total_sent}")
         if not dry_run:
-            helpers.bulk(dst, to_bulk_actions(buffer, index_name_local), request_timeout=120)
+            helpers.bulk(dst, to_bulk_actions(buffer), request_timeout=120)
         total_sent += len(buffer)
         print(f"bulk write done batch_count={len(buffer)} total_sent={total_sent}")
     print(f"transfer finished total_sent={total_sent}")
